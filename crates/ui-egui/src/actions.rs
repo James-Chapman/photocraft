@@ -110,11 +110,12 @@ pub(crate) fn play(app: &mut PhotocraftApp, params: &Value) -> Result<Value, Str
         if action.dialogs.contains(&i) && !app.automation_input && (crate::filter_dialog::has_dialog(id) || crate::adjust_dialog::has_dialog(id)) {
             let label = label_of(id);
             let dialog = crate::dialogs::open_command_dialog(app, id, &label);
+            let token = app.paused_playbacks.pause(action.name.clone(), i + 1, app.session.authorize);
             if let Some(d) = app.ui.dialog_mut(dialog) {
                 if let Some(o) = p.as_object() {
                     d.fields.extend(o.iter().map(|(k, v)| (k.clone(), v.clone())));
                 }
-                d.fields.insert(RESUME.into(), json!({"action": action.name, "from": i + 1}));
+                d.fields.insert(RESUME.into(), json!(token));
             }
             paused = Some(json!({"step": i, "id": id, "dialog": dialog}));
             break;
@@ -436,12 +437,51 @@ pub fn insert_stop_confirm(app: &mut PhotocraftApp, fields: &serde_json::Map<Str
     Ok(r)
 }
 
-/// The key a paused playback leaves in its dialog's fields: `{action, from}`.
+/// The key a paused playback leaves in its dialog's fields: the token of its [`PausedPlayback`].
 pub const RESUME: &str = "__resumeAction";
 
+/// The automation gate a session installs ([`photocraft_engine::Session::authorize`]).
+type Gate = fn(&str, &Value) -> photocraft_engine::Result<()>;
+
+/// A playback paused at a step dialog: the action and step it continues from, and the gate it
+/// was playing under (`None` for one a person started).
+#[derive(Clone, Debug)]
+pub(crate) struct PausedPlayback {
+    action: String,
+    from: usize,
+    gate: Option<Gate>,
+}
+
+/// The paused playbacks, by the token their dialog carries. They live in the app, not in the
+/// dialog: automation can write a dialog's fields, so a field naming the action, its next step
+/// or its authority would let it resume any action, ungated.
+#[derive(Debug, Default)]
+pub(crate) struct PausedPlaybacks {
+    last: u64,
+    paused: std::collections::HashMap<u64, PausedPlayback>,
+}
+
+impl PausedPlaybacks {
+    fn pause(&mut self, action: String, from: usize, gate: Option<Gate>) -> u64 {
+        self.last = self.last.wrapping_add(1);
+        self.paused.insert(self.last, PausedPlayback { action, from, gate });
+        self.last
+    }
+
+    fn take(&mut self, token: &Value) -> Option<PausedPlayback> {
+        token.as_u64().and_then(|token| self.paused.remove(&token))
+    }
+}
+
 /// A step dialog confirmed: continue the action after it (`dialogs::confirm` calls this).
+///
+/// The remaining steps run under the gate the playback paused with, however the dialog was
+/// confirmed: a control request, synthetic Enter or OK, or a click.
 pub fn resume(app: &mut PhotocraftApp, fields: &serde_json::Map<String, Value>) -> Result<(), String> {
-    let Some(r) = fields.get(RESUME) else { return Ok(()) };
+    let Some(token) = fields.get(RESUME) else { return Ok(()) };
+    let Some(paused) = app.paused_playbacks.take(token) else {
+        return Err("this dialog doesn't belong to a paused action".into());
+    };
     // The dialog's command may run as a background job; the next step needs its result.
     if let Some(doc) = app.session.active().map(|d| d.doc.id)
         && let Some(job) = app.session.job_on(doc)
@@ -452,8 +492,12 @@ pub fn resume(app: &mut PhotocraftApp, fields: &serde_json::Map<String, Value>) 
         app.ui.status_error = true;
         return Err(e.to_string());
     }
-    let params = json!({"action": r.get("action").cloned().unwrap_or(Value::Null), "from": r.get("from").cloned().unwrap_or(Value::Null)});
-    match play(app, &params) {
+    let params = json!({"action": paused.action, "from": paused.from});
+    let saved = app.session.authorize;
+    app.session.authorize = paused.gate.or(saved);
+    let played = play(app, &params);
+    app.session.authorize = saved;
+    match played {
         Ok(v) => {
             report_play(app, &v);
             Ok(())
@@ -469,7 +513,8 @@ pub fn resume(app: &mut PhotocraftApp, fields: &serde_json::Map<String, Value>) 
 
 /// A step dialog cancelled: the action stops there, as in Photoshop.
 pub fn stopped(app: &mut PhotocraftApp, fields: &serde_json::Map<String, Value>) {
-    if fields.contains_key(RESUME) {
+    if let Some(token) = fields.get(RESUME) {
+        app.paused_playbacks.take(token);
         app.ui.status = tl!("Action playback stopped").to_string();
         app.ui.status_error = false;
     }
@@ -1659,7 +1704,7 @@ mod tests {
         let id = v["paused"]["dialog"].as_u64().unwrap();
         let d = app.ui.dialog_mut(id).unwrap();
         assert_eq!(d.fields["radius"], 3, "the dialog opens on the recorded values");
-        assert_eq!(d.fields[RESUME], json!({"action": "Blur", "from": 2}));
+        assert!(d.fields[RESUME].is_u64(), "the dialog carries only the pause's token: {}", d.fields[RESUME]);
         assert!(app.session.active().unwrap().doc.selection.is_none(), "nothing after the dialog ran yet");
         report_play(&mut app, &v);
         assert!(app.ui.status.contains("dialog"), "{}", app.ui.status);
@@ -1690,6 +1735,48 @@ mod tests {
         let v = play(&mut app, &json!({"action": "Blur"})).unwrap();
         assert_eq!(v["ran"], 3, "{v}");
         assert!(v.get("paused").is_none());
+    }
+
+    fn deny_select_all(id: &str, _: &Value) -> photocraft_engine::Result<()> {
+        if id == "select.all" { Err(photocraft_engine::EngineError::Other("select.all denied".into())) } else { Ok(()) }
+    }
+
+    /// An action an automation client plays (`control::handle` installs the gate, then removes
+    /// it) pauses at a step dialog; confirming the dialog later, here with synthetic Enter or
+    /// OK, runs the remaining steps under the same gate.
+    #[test]
+    fn a_paused_playback_keeps_its_automation_gate_when_the_dialog_is_confirmed() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 16, "height": 16})).unwrap();
+        let mut a = Action::new("Seeded", vec![("filter.blur.gaussianBlur".into(), json!({"radius": 1})), ("select.all".into(), json!({}))]);
+        a.dialogs.insert(0);
+        app.session.actions.list.push(a);
+        app.session.authorize = Some(deny_select_all);
+        let v = play(&mut app, &json!({"action": "Seeded"})).unwrap();
+        app.session.authorize = None;
+        let id = v["paused"]["dialog"].as_u64().unwrap();
+        app.automation_input = true;
+        let _ = crate::dialogs::confirm(&mut app, id);
+        app.automation_input = false;
+        assert!(app.session.active().unwrap().doc.selection.is_none(), "the denied step did not run");
+        assert!(app.ui.status.contains("select.all denied"), "{}", app.ui.status);
+    }
+
+    /// The dialog names only its pause: changing its fields can't resume another action.
+    #[test]
+    fn a_step_dialog_resumes_only_the_playback_that_paused_it() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 16, "height": 16})).unwrap();
+        let mut a = Action::new("Blur", vec![("filter.blur.gaussianBlur".into(), json!({"radius": 1}))]);
+        a.dialogs.insert(0);
+        app.session.actions.list.push(a);
+        app.session.actions.list.push(Action::new("Seeded", vec![("select.all".into(), json!({}))]));
+        let v = play(&mut app, &json!({"action": "Blur"})).unwrap();
+        let id = v["paused"]["dialog"].as_u64().unwrap();
+        app.ui.dialog_mut(id).unwrap().fields.insert(RESUME.into(), json!({"action": "Seeded", "from": 0}));
+        let r = crate::dialogs::confirm(&mut app, id);
+        assert!(app.session.active().unwrap().doc.selection.is_none(), "the other action did not play");
+        assert!(r.is_err_and(|e| e.contains("paused action")));
     }
 
     #[test]
